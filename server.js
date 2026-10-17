@@ -553,5 +553,5 @@ load();
 bootstrapAdmin();
 module.exports = { server };
 if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => console.log(`Pickup Logger running on http://localhost:${PORT}`);
+  server.listen(PORT, '0.0.0.0', () => console.log(`Pickup Logger running on http://localhost:${PORT}`));
 }
