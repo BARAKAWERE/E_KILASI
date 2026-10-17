@@ -1,0 +1,10 @@
+{
+  "name": "pickup-logger",
+  "version": "1.0.0",
+  "description": "Driver trip logger: driver and admin dashboards in a single Node.js file",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node --test" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED",
+  "private": true
+}

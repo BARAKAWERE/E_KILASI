@@ -29,12 +29,44 @@ const PER_PAGE = 100, MAX_PAX = 500, MAX_COPY_ROWS = 5000;
 if (!process.env.SECRET_KEY) console.warn('WARNING: SECRET_KEY not set. Everyone is signed out on every restart.');
 
 // ----------------------------------------------------------------- storage
-// One JSON file, held in memory, written atomically (temp file + rename) after every change.
+// All data lives in memory (`db`). Where it is saved depends on the settings:
+//   - SUPABASE_URL + SUPABASE_KEY set -> saved to a free Supabase table (survives Render's free-plan restarts)
+//   - otherwise                       -> saved to the JSON file DATA_FILE (atomic write)
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
+const REMOTE = !!(SUPABASE_URL && SUPABASE_KEY);
 let db = { seq: { user: 0, log: 0 }, users: [], logs: [] };
-function load() {
-  try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+
+const remoteHeaders = () => ({ apikey: SUPABASE_KEY, ...(SUPABASE_KEY.startsWith('eyJ') ? { Authorization: 'Bearer ' + SUPABASE_KEY } : {}) });
+async function load() {
+  if (!REMOTE) {
+    try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    return;
+  }
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?id=eq.1&select=data`, { headers: remoteHeaders() });
+  if (!res.ok) throw new Error(`Supabase load failed (${res.status}): ${await res.text()}. Did you run supabase-setup.sql?`);
+  const rows = await res.json();
+  if (rows.length) db = rows[0].data;
 }
+let saving = false, again = false, retryTimer = null;
+async function pushRemote() {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?on_conflict=id`, {
+    method: 'POST',
+    headers: { ...remoteHeaders(), 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify({ id: 1, data: db, updated_at: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error(`Supabase save failed (${res.status}): ${await res.text()}`);
+}
+async function flushRemote() {
+  if (saving) { again = true; return; }
+  saving = true;
+  try { do { again = false; await pushRemote(); } while (again); }
+  catch (e) { console.error(e.message); clearTimeout(retryTimer); retryTimer = setTimeout(flushRemote, 5000); }
+  finally { saving = false; }
+}
+async function flushNow() { if (!REMOTE) return; await flushRemote(); while (saving) await new Promise(r => setTimeout(r, 50)); }
 function save() {
+  if (REMOTE) { flushRemote(); return; }
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
   const tmp = DATA_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(db));
@@ -415,6 +447,7 @@ function driversPage(ctx) {
 const attempts = new Map(); // "ip|username" -> [timestamps]
 
 async function handle(req, res) {
+  await ready;
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname === '/healthz') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
   if (url.pathname === '/logo' && LOGO) {
@@ -549,9 +582,22 @@ const server = http.createServer((req, res) => {
   });
 });
 
-load();
-bootstrapAdmin();
-module.exports = { server };
+const ready = (async () => { await load(); bootstrapAdmin(); })();
+module.exports = { server, ready };
 if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => console.log(`Pickup Logger running on http://localhost:${PORT}`));
+  ready.then(() => {
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`Pickup Logger running on port ${PORT} (storage: ${REMOTE ? 'Supabase' : 'file ' + DATA_FILE})`);
+      // Keep-awake for Render's free plan: while running, the app calls its own public address now and then,
+      // so Render sees traffic and does not put it to sleep. Off on your own computer (no RENDER_EXTERNAL_URL).
+      const url = (process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+      const minutes = Number(process.env.KEEP_ALIVE_MINUTES) || 10;
+      if (url && process.env.KEEP_ALIVE !== '0') {
+        setInterval(() => fetch(url + '/healthz').catch(() => {}), minutes * 60 * 1000).unref();
+        console.log(`Keep-awake on: calling ${url}/healthz every ${minutes} min`);
+      }
+    });
+  }).catch(e => { console.error(e.message); process.exit(1); });
+  // Render sends SIGTERM when it restarts or sleeps the service: finish saving first.
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => console.log(`Pickup Logger running on http://localhost:${PORT}`));
 }
